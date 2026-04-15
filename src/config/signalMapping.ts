@@ -1,6 +1,8 @@
 /**
  * Signal Mapping Configuration
  * Mirrored from insidebroker-backend
+ * This file is the source of truth
+ * for signal detection rules.
  * insidebroker-voice will own and
  * extend this configuration as
  * the custom STT model matures.
