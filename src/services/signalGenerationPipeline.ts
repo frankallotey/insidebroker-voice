@@ -1,32 +1,59 @@
 /**
- * SignalGenerationPipeline — S6-2
+ * SignalGenerationPipeline — S6-2 mirror
+ *
+ * Mirrored from insidebroker-backend (S6-2 / S6-3).
  *
  * Orchestrates the full chain from Contact Lens transcript segments to
- * WebSocket broadcast via Signal Channel.
+ * signal emission via Signal Channel.
  *
  * Chain:
  *   Contact Lens segments
  *     → PCI guard (abort if payment-intent content detected)
  *     → TranscriptIngestionService (signal candidate extraction)
- *     → SignalService (emit HIGH / MEDIUM candidates to Signal Channel)
- *     → Recommendation Engine + WebSocket broadcast (downstream, unchanged)
+ *     → ISignalService (emit HIGH / MEDIUM candidates to Signal Channel)
+ *     → Downstream unchanged
  *
- * ABSOLUTE CONSTRAINTS (SOT v1.2, claude.md):
+ * ABSOLUTE CONSTRAINTS (SOT v1.2, CLAUDE.md):
  *   INV-002: Segment Content must never appear in any log statement.
  *   INV-003: Segment Content must never be written to any DB table.
  *   PCI guard runs FIRST — before any extraction or emission.
  *
  * WIRING NOTE:
  *   The ITranscriptIngestionService injected here must be configured for
- *   extraction only (no SignalService wired). Signal emission is owned by
- *   this pipeline via its injected SignalService. Wiring a SignalService into
- *   both the ingestion service and this pipeline would cause double-emission.
+ *   extraction only (no signal emitter wired). Signal emission is owned by
+ *   this pipeline via its injected ISignalService. Wiring a signal emitter
+ *   into both the ingestion service and this pipeline would cause double-emission.
  */
 
-import type { ContactLensTranscriptSegment } from '../../domain/contactLens';
-import type { ITranscriptIngestionService } from './ITranscriptIngestionService';
-import type { SignalService } from '../signalService';
-import { logInfo, logError } from '../../lib/logger';
+import type { ContactLensTranscriptSegment } from '../domain/contactLens';
+import { CallSessionState } from '../domain/contactLens';
+import type { ITranscriptIngestionService } from '../interfaces/ITranscriptIngestionService';
+
+// ---------------------------------------------------------------------------
+// ISignalService — minimal interface mirroring backend SignalService contract.
+// In voice context this boundary is fulfilled by a backend-compatible adapter.
+// ---------------------------------------------------------------------------
+
+export interface SignalInput {
+  signal_type: string;
+  session_id:  string;
+  advisor_id:  string;
+  emitted_at:  string;
+  metadata?:   Record<string, unknown>;
+}
+
+export interface ISignalService {
+  processSignal(input: SignalInput): Promise<{ status: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// ISessionStateReader — mirrors backend ISessionStateReader (S6-3).
+// Injected so the pipeline can check PAYMENT_SUSPENDED before processing.
+// ---------------------------------------------------------------------------
+
+export interface ISessionStateReader {
+  getSessionState(sessionId: string): Promise<CallSessionState | null>;
+}
 
 const COMPONENT = 'SignalGenerationPipeline';
 
@@ -83,8 +110,9 @@ export interface PipelineResult {
 
 export class SignalGenerationPipeline {
   constructor(
-    private readonly ingestionService: ITranscriptIngestionService,
-    private readonly signalService: SignalService,
+    private readonly ingestionService:    ITranscriptIngestionService,
+    private readonly signalService:       ISignalService,
+    private readonly sessionStateReader?: ISessionStateReader,
   ) {}
 
   async processContactLensSegments(
@@ -96,17 +124,38 @@ export class SignalGenerationPipeline {
   ): Promise<PipelineResult> {
     const startMs = Date.now();
 
+    // Step 0: Payment safe mode check.
+    // If the session is PAYMENT_SUSPENDED, skip all processing immediately.
+    if (this.sessionStateReader) {
+      const state = await this.sessionStateReader.getSessionState(sessionId);
+      if (state === CallSessionState.PAYMENT_SUSPENDED) {
+        console.log(
+          `[${COMPONENT}] Session ${sessionId} in payment safe mode — segments skipped`,
+          JSON.stringify({ session_id: sessionId, contact_id: contactId }),
+        );
+        return {
+          contactId,
+          sessionId,
+          segmentsProcessed: 0,
+          signalCandidates:  0,
+          signalsEmitted:    0,
+          pciSuppressed:     true,
+          processingTimeMs:  Date.now() - startMs,
+        };
+      }
+    }
+
     // Step 1: PCI guard — must run before any other processing.
-    // If payment-intent content is detected the pipeline aborts immediately.
-    // TranscriptIngestionService also guards per-segment (defense-in-depth),
-    // but we gate here so no extraction or emission occurs at all.
     if (segmentsContainPCI(segments)) {
-      logInfo(COMPONENT, 'PCI pattern detected in segment batch — pipeline suppressed', {
-        contact_id:    contactId,
-        session_id:    sessionId,
-        segment_count: segments.length,
-        // Content intentionally never logged — INV-002
-      });
+      console.log(
+        `[${COMPONENT}] PCI pattern detected in segment batch — pipeline suppressed`,
+        JSON.stringify({
+          contact_id:    contactId,
+          session_id:    sessionId,
+          segment_count: segments.length,
+          // Content intentionally never logged — INV-002
+        }),
+      );
 
       return {
         contactId,
@@ -120,8 +169,6 @@ export class SignalGenerationPipeline {
     }
 
     // Step 2: Extract signal candidates via TranscriptIngestionService.
-    // Session context is passed so the ingestion layer can handle any
-    // per-segment PCI events (e.g. PAYMENT_SUSPENDED) if they arise.
     const ingestionResult = await this.ingestionService.processSegments(
       contactId,
       segments,
@@ -136,7 +183,7 @@ export class SignalGenerationPipeline {
         continue;
       }
 
-      const input = {
+      const input: SignalInput = {
         signal_type: candidate.signal_type,
         session_id:  sessionId,
         advisor_id:  advisorId,
@@ -154,39 +201,43 @@ export class SignalGenerationPipeline {
         if (result.status === 'accepted') {
           signalsEmitted++;
         } else {
-          logInfo(COMPONENT, 'Signal not accepted by Signal Channel', {
-            status:      result.status,
-            signal_type: candidate.signal_type,
-            session_id:  sessionId,
-            contact_id:  contactId,
-          });
+          console.log(
+            `[${COMPONENT}] Signal not accepted by Signal Channel`,
+            JSON.stringify({
+              status:      result.status,
+              signal_type: candidate.signal_type,
+              session_id:  sessionId,
+              contact_id:  contactId,
+            }),
+          );
         }
       } catch (err) {
-        logError(
-          COMPONENT,
-          'Failed to emit signal to Signal Channel',
-          err instanceof Error ? err : new Error(String(err)),
-          {
+        console.error(
+          `[${COMPONENT}] Failed to emit signal to Signal Channel`,
+          JSON.stringify({
             signal_type: candidate.signal_type,
             session_id:  sessionId,
             contact_id:  contactId,
-          },
+            error:       err instanceof Error ? err.message : String(err),
+          }),
         );
       }
     }
 
     // Step 4: Log pipeline result.
-    // Never log segment count, signal types, or anything that could
-    // be correlated with transcript content — INV-002.
+    // Never log segment content — INV-002.
     const processingTimeMs = Date.now() - startMs;
-    logInfo(COMPONENT, 'Pipeline complete', {
-      contact_id:         contactId,
-      session_id:         sessionId,
-      segments_processed: ingestionResult.segmentsProcessed,
-      signal_candidates:  ingestionResult.signalCandidates.length,
-      signals_emitted:    signalsEmitted,
-      processing_time_ms: processingTimeMs,
-    });
+    console.log(
+      `[${COMPONENT}] Pipeline complete`,
+      JSON.stringify({
+        contact_id:         contactId,
+        session_id:         sessionId,
+        segments_processed: ingestionResult.segmentsProcessed,
+        signal_candidates:  ingestionResult.signalCandidates.length,
+        signals_emitted:    signalsEmitted,
+        processing_time_ms: processingTimeMs,
+      }),
+    );
 
     // Step 5: Return PipelineResult.
     return {

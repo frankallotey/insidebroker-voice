@@ -72,3 +72,17 @@ export interface KinesisRecord {
   SequenceNumber: string;
   ApproximateArrivalTimestamp: number;
 }
+
+// ---------------------------------------------------------------------------
+// Call Session State — mirrors insidebroker-backend/domain/callSession.ts
+// Required by SignalGenerationPipeline for payment safe mode check.
+// ---------------------------------------------------------------------------
+
+export const CallSessionState = {
+  CREATED:            'CREATED',
+  LIVE:               'LIVE',
+  PAYMENT_SUSPENDED:  'PAYMENT_SUSPENDED',
+  ENDED:              'ENDED',
+  ERROR:              'ERROR',
+} as const;
+export type CallSessionState = typeof CallSessionState[keyof typeof CallSessionState];
