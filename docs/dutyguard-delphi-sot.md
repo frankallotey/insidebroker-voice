@@ -736,6 +736,22 @@ Per Signal Meaning SOT:
 - `CAUTION` unresolved → PRIMARY
 - `ADVISORY` → CONTEXTUAL
 
+### 10.5 EVIDENCEVIEWMODEL OWNERSHIP
+
+EvidenceViewModel is the surface-safe rendering contract for evidence
+records. It is NOT defined in this document.
+
+Canonical ownership of EvidenceViewModel belongs to the Surface
+Interpretation Layer SOT:
+  docs/interpretation-layer-sot.md
+
+The EvidenceRecord schema defined in Section 10.2 is backend truth.
+EvidenceViewModel consumes it and produces a human-readable,
+audit-ready output for the Compliance Dashboard FCA Evidence surface.
+
+No frontend surface should consume EvidenceRecord directly.
+EvidenceViewModel is the only frontend contract for evidence rendering.
+
 ---
 
 ## 11. SCRIPT AND POLICY GOVERNANCE
